@@ -1,0 +1,794 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:intl/date_symbol_data_local.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:table_calendar/table_calendar.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:html/parser.dart' as html_parser;
+import 'package:html/dom.dart' as dom;
+
+// ===================== 설정 =====================
+const String NEWS_API_KEY = 'YOUR_NEWSAPI_KEY'; // ← 네 키로 교체
+// ==============================================
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await initializeDateFormatting('ko_KR', null);
+  runApp(const UlsanCalendarApp());
+}
+
+class UlsanCalendarApp extends StatelessWidget {
+  const UlsanCalendarApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: '울산캘린더',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blue),
+      home: const MainPage(),
+    );
+  }
+}
+
+// ===================== 모델 =====================
+enum EventCategory { festival, exhibition, sport }
+
+extension EventCategoryX on EventCategory {
+  String get label => switch (this) {
+    EventCategory.festival => '축제',
+    EventCategory.exhibition => '공연,전시',
+    EventCategory.sport => '스포츠',
+  };
+  Color get pastel => switch (this) {
+    EventCategory.festival => Colors.redAccent,
+    EventCategory.exhibition => Colors.greenAccent,
+    EventCategory.sport => Colors.blueAccent,
+  }.shade100;
+  Color get dot => switch (this) {
+    EventCategory.festival => Colors.redAccent,
+    EventCategory.exhibition => Colors.greenAccent,
+    EventCategory.sport => Colors.blueAccent,
+  }.shade200;
+}
+
+class EventItem {
+  final String title;              // 짧은 제목(셀 표기)
+  final DateTime start;            // 시작일
+  final DateTime end;              // 종료일(단일이면 start=end)
+  final EventCategory category;    // 카테고리
+  final String? url;               // 원문 링크(옵션)
+
+  EventItem({
+    required this.title,
+    required this.start,
+    required this.end,
+    required this.category,
+    this.url,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'title': title,
+    'start': start.toIso8601String(),
+    'end': end.toIso8601String(),
+    'category': category.name,
+    'url': url,
+  };
+
+  factory EventItem.fromJson(Map<String, dynamic> j) => EventItem(
+    title: j['title'],
+    start: DateTime.parse(j['start']),
+    end: DateTime.parse(j['end']),
+    category: EventCategory.values
+        .firstWhere((e) => e.name == (j['category'] as String)),
+    url: j['url'],
+  );
+}
+
+class NewsHeadline {
+  final String title;
+  final String? url;
+  final EventCategory category; // 이 헤드라인이 속한 카테고리
+
+  NewsHeadline({required this.title, this.url, required this.category});
+
+  String short([int n = 24]) =>
+      title.length > n ? '${title.substring(0, n)}…' : title;
+}
+
+// ===================== 메인 탭 =====================
+class MainPage extends StatefulWidget {
+  const MainPage({super.key});
+  @override
+  State<MainPage> createState() => _MainPageState();
+}
+
+class _MainPageState extends State<MainPage> {
+  int _idx = 0;
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: const [
+        CalendarPage(),
+        HeadlineNewsPage(),
+        BoardPage(),
+        PlaceholderPage(title: '지도(옵션)'),
+      ][_idx],
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _idx,
+        onDestinationSelected: (i) => setState(() => _idx = i),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.calendar_month), label: '캘린더'),
+          NavigationDestination(icon: Icon(Icons.article), label: '뉴스'),
+          NavigationDestination(icon: Icon(Icons.forum), label: '자유게시판'),
+          NavigationDestination(icon: Icon(Icons.map), label: '지도'),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// 캘린더: 자동 크롤링/뉴스 파싱 → 이벤트 반영 + 헤드라인만 링크
+// ============================================================================
+class CalendarPage extends StatefulWidget {
+  const CalendarPage({super.key});
+  @override
+  State<CalendarPage> createState() => _CalendarPageState();
+}
+
+class _CalendarPageState extends State<CalendarPage> {
+  DateTime _focused = DateTime.now();
+  DateTime? _selected;
+
+  // 날짜키 -> 이벤트
+  final Map<String, List<EventItem>> _events = {};
+  bool _syncing = false;
+
+  // 탭 카테고리
+  EventCategory _selectedCat = EventCategory.festival;
+  List<NewsHeadline> _headlines = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _restoreEvents().then((_) async {
+      // 스포츠 시드(질문 이미지 기준) – 문수야구경기장 9/23, 9/25
+      _seedSportsFromScreenshot();
+      await _persistEvents();
+      await _syncAll(); // 전시 크롤링 + 뉴스 동기화
+    });
+  }
+
+  // --------------- 저장/복구 ---------------
+  Future<void> _restoreEvents() async {
+    final prefs = await SharedPreferences.getInstance();
+    final s = prefs.getString('ulsan_events');
+    if (s == null) return;
+    final map = json.decode(s) as Map<String, dynamic>;
+    _events.clear();
+    map.forEach((k, v) {
+      _events[k] = (v as List)
+          .map((e) => EventItem.fromJson(e as Map<String, dynamic>))
+          .toList();
+    });
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _persistEvents() async {
+    final prefs = await SharedPreferences.getInstance();
+    final save =
+    _events.map((k, v) => MapEntry(k, v.map((e) => e.toJson()).toList()));
+    await prefs.setString('ulsan_events', json.encode(save));
+  }
+
+  // --------------- 유틸 ---------------
+  String _keyOf(DateTime d) => '${d.year}-${d.month}-${d.day}';
+  List<EventItem> _getEvents(DateTime d) => _events[_keyOf(d)] ?? [];
+
+  void _addEventRange(EventItem e) {
+    for (DateTime d = DateTime(e.start.year, e.start.month, e.start.day);
+    !d.isAfter(e.end);
+    d = d.add(const Duration(days: 1))) {
+      _events.putIfAbsent(_keyOf(d), () => []);
+      // 중복 방지(제목/카테고리/링크 동일시 스킵)
+      if (!_events[_keyOf(d)]!
+          .any((x) => x.title == e.title && x.category == e.category && x.url == e.url)) {
+        _events[_keyOf(d)]!.add(e);
+      }
+    }
+  }
+
+  String _shortTitle(String t) {
+    final s = t.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return s.length > 18 ? '${s.substring(0, 18)}…' : s;
+  }
+
+  // --------------- 시드 스포츠(질문 이미지) ---------------
+  void _seedSportsFromScreenshot() {
+    final y = DateTime.now().year;
+    final seeds = <EventItem>[
+      EventItem(
+        title: _shortTitle('롯데 vs NC (문수야구경기장, 18:30)'),
+        start: DateTime(y, 9, 23),
+        end: DateTime(y, 9, 23),
+        category: EventCategory.sport,
+        url: null,
+      ),
+      EventItem(
+        title: _shortTitle('롯데 vs LG (문수야구경기장, 18:30)'),
+        start: DateTime(y, 9, 25),
+        end: DateTime(y, 9, 25),
+        category: EventCategory.sport,
+        url: null,
+      ),
+    ];
+    for (final e in seeds) {
+      _addEventRange(e);
+    }
+  }
+
+  // --------------- 동기화(전시 크롤링 + 뉴스 파싱) ---------------
+  Future<void> _syncAll() async {
+    setState(() => _syncing = true);
+    try {
+      // (1) 울산시 전시/공연 크롤링
+      final exhibitions = await _crawlUlsanCulture();
+      for (final e in exhibitions) {
+        _addEventRange(e);
+      }
+
+      // (2) 뉴스 헤드라인 수집(카테고리별) + 날짜 파싱 → 이벤트화
+      final festHeads = await _fetchNewsHeads(
+        '울산 축제 OR 국가정원 축제 OR 울산 페스티벌 OR 울산 행사',
+        EventCategory.festival,
+      );
+      final exHeads = await _fetchNewsHeads(
+        '울산 공연 OR 울산 전시 OR 울산 문화예술',
+        EventCategory.exhibition,
+      );
+      final sportHeads = await _fetchNewsHeads(
+        '문수경기장 OR 문수축구경기장 OR 울산 현대 홈경기 OR 울산HD 경기 일정',
+        EventCategory.sport,
+      );
+
+      // 현재 선택 카테고리의 헤드라인만 표시
+      _headlines = switch (_selectedCat) {
+        EventCategory.festival => festHeads,
+        EventCategory.exhibition => exHeads,
+        EventCategory.sport => sportHeads,
+      };
+
+      // 뉴스 → 일정
+      _eventsFromNews(festHeads);
+      _eventsFromNews(exHeads);
+      _eventsFromNews(sportHeads);
+
+      await _persistEvents();
+    } catch (_) {
+      // 네트워크 실패/구조변경은 조용히 패스
+    } finally {
+      if (mounted) setState(() => _syncing = false);
+    }
+  }
+
+  // 울산시 문화(전시/공연) 메인 크롤링
+  Future<List<EventItem>> _crawlUlsanCulture() async {
+    final url = Uri.parse('https://www.ulsan.go.kr/s/uam/main.ulsan');
+    final res = await http.get(url, headers: {
+      'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36'
+    });
+    if (res.statusCode != 200) return [];
+
+    final doc = html_parser.parse(utf8.decode(res.bodyBytes));
+    final blocks = <dom.Element>[];
+
+    // 다양한 카드/리스트를 포괄적으로 수집 (텍스트에 전시/공연/문화/행사 포함)
+    final cands = <dom.Element>[];
+    cands.addAll(doc.querySelectorAll('a'));
+    cands.addAll(doc.querySelectorAll('li'));
+    cands.addAll(doc.querySelectorAll('div'));
+    final seen = <dom.Element>{};
+    for (final el in cands) {
+      if (seen.contains(el)) continue;
+      final t = el.text.trim();
+      if (t.contains('전시') || t.contains('공연') || t.contains('문화') || t.contains('행사')) {
+        blocks.add(el);
+        seen.add(el);
+      }
+    }
+
+    final resList = <EventItem>[];
+    // 날짜/기간 패턴
+    final regRange = RegExp(
+        r'(\d{4})?\s*\.?\s*(\d{1,2})\s*\.\s*(\d{1,2})\s*(?:\([월화수목금토일]\))?\s*[~\-]\s*(?:(\d{4})?\s*\.?\s*)?(\d{1,2})\s*\.\s*(\d{1,2})');
+    final regSingle = RegExp(
+        r'(?:(\d{4})\s*\.?)?\s*(\d{1,2})\s*\.\s*(\d{1,2})\s*(?:\([월화수목금토일]\))?');
+
+    for (final b in blocks) {
+      final text = b.text.replaceAll('\n', ' ').replaceAll(RegExp(r'\s+'), ' ');
+      DateTime? s, e;
+
+      final mR = regRange.firstMatch(text);
+      if (mR != null) {
+        final y1 = (mR.group(1)?.isNotEmpty ?? false)
+            ? int.parse(mR.group(1)!)
+            : DateTime.now().year;
+        final m1 = int.parse(mR.group(2)!);
+        final d1 = int.parse(mR.group(3)!);
+        final y2 = (mR.group(4)?.isNotEmpty ?? false)
+            ? int.parse(mR.group(4)!)
+            : y1;
+        final m2 = int.parse(mR.group(5)!);
+        final d2 = int.parse(mR.group(6)!);
+        s = DateTime(y1, m1, d1);
+        e = DateTime(y2, m2, d2);
+      } else {
+        final mS = regSingle.firstMatch(text);
+        if (mS != null) {
+          final y = (mS.group(1)?.isNotEmpty ?? false)
+              ? int.parse(mS.group(1)!)
+              : DateTime.now().year;
+          final mm = int.parse(mS.group(2)!);
+          final dd = int.parse(mS.group(3)!);
+          s = DateTime(y, mm, dd);
+          e = s;
+        }
+      }
+
+      if (s == null || e == null) continue;
+
+      // 제목 후보 추출
+      String title = _titlePref(text);
+      if (title.isEmpty) title = text;
+      final linkTag = b.querySelector('a');
+      String? link;
+      if (linkTag != null) {
+        final href = linkTag.attributes['href'];
+        if (href != null && href.isNotEmpty) {
+          link = href.startsWith('http') ? href : 'https://www.ulsan.go.kr$href';
+        }
+      }
+
+      resList.add(EventItem(
+        title: _shortTitle(title),
+        start: s,
+        end: e,
+        category: EventCategory.exhibition,
+        url: link,
+      ));
+    }
+    return resList;
+  }
+
+  String _titlePref(String raw) {
+    // 「 」「 」、“ ”、" ", [ ] 등 괄호 안 우선
+    final r = RegExp(r'「([^」]+)」|『([^』]+)』|“([^”]+)”|\"([^\"]+)\"|\[([^\]]+)\]');
+    final m = r.firstMatch(raw);
+    if (m != null) {
+      for (int i = 1; i <= 5; i++) {
+        final g = m.group(i);
+        if (g != null && g.trim().isNotEmpty) return g.trim();
+      }
+    }
+    // 콜론 앞 절반
+    if (raw.contains(':')) return raw.split(':').first.trim();
+    return raw.trim();
+  }
+
+  Future<List<NewsHeadline>> _fetchNewsHeads(
+      String query, EventCategory cat) async {
+    if (NEWS_API_KEY.isEmpty || NEWS_API_KEY == 'YOUR_NEWSAPI_KEY') return [];
+    final url = Uri.parse(
+        'https://newsapi.org/v2/everything?q=$query&language=ko&sortBy=publishedAt&pageSize=40&apiKey=$NEWS_API_KEY');
+    final res = await http.get(url);
+    if (res.statusCode != 200) return [];
+    final data = json.decode(res.body);
+    final List arr = data['articles'] ?? [];
+    return arr
+        .map((a) => NewsHeadline(
+      title: (a['title'] ?? '').toString(),
+      url: ((a['url'] ?? '') as String).isEmpty ? null : a['url'],
+      category: cat,
+    ))
+        .where((h) => h.title.isNotEmpty)
+        .toList();
+  }
+
+  // 헤드라인에서 날짜/기간 파싱 → 이벤트로 변환
+  void _eventsFromNews(List<NewsHeadline> list) {
+    final year = DateTime.now().year;
+
+    final patRangeSameMonth =
+    RegExp(r'(\d{1,2})\s*월\s*(\d{1,2})\s*~\s*(\d{1,2})\s*일'); // 9월 24~26일
+    final patRangeCross =
+    RegExp(r'(\d{1,2})\s*월\s*(\d{1,2})\s*일\s*[~\-]\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일');
+    final patSingle = RegExp(r'(\d{1,2})\s*월\s*(\d{1,2})\s*일');
+
+    for (final h in list) {
+      final t = h.title;
+
+      DateTime? s, e;
+
+      final mCross = patRangeCross.firstMatch(t);
+      if (mCross != null) {
+        final m1 = int.parse(mCross.group(1)!);
+        final d1 = int.parse(mCross.group(2)!);
+        final m2 = int.parse(mCross.group(3)!);
+        final d2 = int.parse(mCross.group(4)!);
+        s = DateTime(year, m1, d1);
+        e = DateTime(year, m2, d2);
+      } else {
+        final mSame = patRangeSameMonth.firstMatch(t);
+        if (mSame != null) {
+          final m = int.parse(mSame.group(1)!);
+          final d1 = int.parse(mSame.group(2)!);
+          final d2 = int.parse(mSame.group(3)!);
+          s = DateTime(year, m, d1);
+          e = DateTime(year, m, d2);
+        } else {
+          final mOne = patSingle.firstMatch(t);
+          if (mOne != null) {
+            final m = int.parse(mOne.group(1)!);
+            final d = int.parse(mOne.group(2)!);
+            s = DateTime(year, m, d);
+            e = s;
+          }
+        }
+      }
+
+      if (s != null && e != null) {
+        _addEventRange(EventItem(
+          title: _shortTitle(_titlePref(t)),
+          start: s,
+          end: e,
+          category: h.category,
+          url: h.url,
+        ));
+      }
+    }
+  }
+
+  // --------------- UI ---------------
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('울산캘린더'),
+        actions: [
+          IconButton(
+            tooltip: '동기화(전시/뉴스)',
+            onPressed: _syncing ? null : _syncAll,
+            icon: _syncing
+                ? const SizedBox(
+                width: 20, height: 20, child: CircularProgressIndicator())
+                : const Icon(Icons.sync),
+          ),
+          IconButton(
+            tooltip: '설정(추후)',
+            onPressed: () {},
+            icon: const Icon(Icons.settings),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          TableCalendar<EventItem>(
+            locale: 'ko_KR',
+            firstDay: DateTime.utc(2020, 1, 1),
+            lastDay: DateTime.utc(2032, 12, 31),
+            focusedDay: _focused,
+            selectedDayPredicate: (d) => isSameDay(_selected, d),
+            onDaySelected: (sel, foc) {
+              setState(() {
+                _selected = sel;
+                _focused = foc;
+              });
+              showModalBottomSheet(
+                context: context,
+                builder: (_) => _eventSheet(sel),
+              );
+            },
+            eventLoader: _getEvents,
+            calendarBuilders: CalendarBuilders<EventItem>(
+              markerBuilder: (context, date, events) {
+                if (events.isEmpty) return const SizedBox();
+                // 아래 점 3개까지 표시(카테고리별 파스텔)
+                final dots = events.take(3).map((e) {
+                  return Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 1.5),
+                    width: 6, height: 6,
+                    decoration: BoxDecoration(color: e.category.dot, shape: BoxShape.circle),
+                  );
+                }).toList();
+                return Positioned(bottom: 2, child: Row(children: dots));
+              },
+            ),
+            calendarStyle: const CalendarStyle(
+              todayDecoration: BoxDecoration(color: Colors.blue, shape: BoxShape.circle),
+              selectedDecoration: BoxDecoration(color: Colors.orange, shape: BoxShape.circle),
+            ),
+          ),
+          const SizedBox(height: 10),
+          // 카테고리 버튼
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Row(
+              children: [
+                _catButton(EventCategory.festival),
+                _catButton(EventCategory.exhibition),
+                _catButton(EventCategory.sport),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          // 헤드라인만(클릭 → 링크)
+          Expanded(
+            child: _headlines.isEmpty
+                ? const Center(child: Text('헤드라인이 아직 없어요. 상단 ↻ 동기화 눌러봐!'))
+                : ListView.builder(
+              itemCount: _headlines.length,
+              itemBuilder: (c, i) {
+                final h = _headlines[i];
+                return ListTile(
+                  dense: true,
+                  title: Text(h.title),
+                  onTap: () async {
+                    if (h.url != null && await canLaunch(h.url!)) {
+                      await launch(h.url!);
+                    }
+                  },
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _catButton(EventCategory cat) {
+    final sel = _selectedCat == cat;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () async {
+          setState(() {
+            _selectedCat = cat;
+            _headlines = [];
+          });
+          // 카테고리 전환 시 뉴스 헤드라인만 즉시 재조회
+          List<NewsHeadline> heads = [];
+          if (cat == EventCategory.festival) {
+            heads = await _fetchNewsHeads(
+                '울산 축제 OR 국가정원 축제 OR 울산 페스티벌 OR 울산 행사', cat);
+          } else if (cat == EventCategory.exhibition) {
+            heads = await _fetchNewsHeads(
+                '울산 공연 OR 울산 전시 OR 울산 문화예술', cat);
+          } else {
+            heads = await _fetchNewsHeads(
+                '문수경기장 OR 문수축구경기장 OR 울산 현대 홈경기 OR 울산HD 경기 일정', cat);
+          }
+          if (mounted) setState(() => _headlines = heads);
+        },
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          margin: const EdgeInsets.symmetric(horizontal: 4),
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            color: sel ? cat.pastel : cat.pastel.withOpacity(0.4),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: sel ? Colors.black45 : Colors.transparent),
+          ),
+          child: Center(
+            child: Text(cat.label,
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _eventSheet(DateTime day) {
+    final list = _getEvents(day);
+    return SizedBox(
+      height: 360,
+      child: Column(
+        children: [
+          ListTile(
+            title: Text("${day.year}.${day.month}.${day.day} 일정 (${list.length}개)"),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: list.isEmpty
+                ? const Center(child: Text('등록된 일정이 없습니다.'))
+                : ListView.separated(
+              itemCount: list.length,
+              separatorBuilder: (_, __) => const Divider(height: 1),
+              itemBuilder: (c, i) {
+                final e = list[i];
+                final range = e.start.isAtSameMomentAs(e.end)
+                    ? "${e.start.month}/${e.start.day}"
+                    : "${e.start.month}/${e.start.day}~${e.end.month}/${e.end.day}";
+                return ListTile(
+                  leading: Icon(Icons.event, color: e.category.dot),
+                  title: Text(e.title),
+                  subtitle: Text('${e.category.label} · $range'),
+                  onTap: () async {
+                    if (e.url != null && await canLaunch(e.url!)) {
+                      await launch(e.url!);
+                    }
+                  },
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// 울산 전체 뉴스 탭(헤드라인만 + 링크)
+// ============================================================================
+class HeadlineNewsPage extends StatefulWidget {
+  const HeadlineNewsPage({super.key});
+  @override
+  State<HeadlineNewsPage> createState() => _HeadlineNewsPageState();
+}
+
+class _HeadlineNewsPageState extends State<HeadlineNewsPage> {
+  List<NewsHeadline> _items = [];
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    if (NEWS_API_KEY.isEmpty || NEWS_API_KEY == 'YOUR_NEWSAPI_KEY') {
+      setState(() {
+        _items = [];
+        _loading = false;
+      });
+      return;
+    }
+    final url = Uri.parse(
+        'https://newsapi.org/v2/everything?q=울산&language=ko&sortBy=publishedAt&pageSize=40&apiKey=$NEWS_API_KEY');
+    final res = await http.get(url);
+    if (!mounted) return;
+    if (res.statusCode == 200) {
+      final data = json.decode(res.body);
+      final List arr = data['articles'] ?? [];
+      setState(() {
+        _items = arr
+            .map((a) => NewsHeadline(
+          title: (a['title'] ?? '').toString(),
+          url: ((a['url'] ?? '') as String).isEmpty ? null : a['url'],
+          category: EventCategory.festival, // 의미 없음(탭용)
+        ))
+            .where((h) => h.title.isNotEmpty)
+            .toList();
+        _loading = false;
+      });
+    } else {
+      setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('📰 울산 뉴스(헤드라인)')),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _items.isEmpty
+          ? const Center(child: Text('API 키가 없거나 뉴스가 없습니다.'))
+          : ListView.separated(
+        itemCount: _items.length,
+        separatorBuilder: (_, __) => const Divider(height: 1),
+        itemBuilder: (c, i) {
+          final h = _items[i];
+          return ListTile(
+            title: Text(h.title),
+            onTap: () async {
+              if (h.url != null && await canLaunch(h.url!)) {
+                await launch(h.url!);
+              }
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// 자유게시판
+// ============================================================================
+class BoardPage extends StatefulWidget {
+  const BoardPage({super.key});
+  @override
+  State<BoardPage> createState() => _BoardPageState();
+}
+
+class _BoardPageState extends State<BoardPage> {
+  final controller = TextEditingController();
+  List<String> posts = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    posts = prefs.getStringList('posts') ?? [];
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _save() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('posts', posts);
+  }
+
+  void _add() async {
+    final t = controller.text.trim();
+    if (t.isEmpty) return;
+    setState(() => posts.insert(0, t));
+    controller.clear();
+    await _save();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('💬 자유게시판')),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: controller,
+                    decoration: const InputDecoration(
+                      hintText: '글을 입력하세요',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(onPressed: _add, child: const Text('등록')),
+              ],
+            ),
+          ),
+          Expanded(
+            child: ListView.separated(
+              itemCount: posts.length,
+              separatorBuilder: (_, __) => const Divider(height: 1),
+              itemBuilder: (c, i) => ListTile(title: Text(posts[i])),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// 지도 자리(옵션)
+// ============================================================================
+class PlaceholderPage extends StatelessWidget {
+  final String title;
+  const PlaceholderPage({super.key, required this.title});
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(appBar: AppBar(title: Text(title)), body: const SizedBox());
+  }
+}
