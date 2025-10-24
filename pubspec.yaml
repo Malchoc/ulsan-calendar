@@ -1,0 +1,32 @@
+name: ulsan
+description: "울산 축제 캘린더 앱"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # ✅ 추가 패키지들
+  intl: ^0.19.0                # 날짜 형식 변환용
+  table_calendar: ^3.1.2       # 달력 UI (1번 요구사항용)
+  http: ^1.2.2                 # 뉴스 데이터 불러오기용
+  google_maps_flutter: ^2.7.0  # 지도 표시용 (GPS 기반 관광지)
+  geolocator: ^11.0.0          # 내 위치 가져오기
+  shared_preferences: ^2.3.2   # 자유게시판 글 저장 (로컬 저장)
+  url_launcher: ^6.3.1         # 뉴스 기사 링크 열기용
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
