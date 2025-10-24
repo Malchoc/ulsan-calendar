@@ -1,0 +1,588 @@
+import 'package:flutter/material.dart';
+import 'package:table_calendar/table_calendar.dart';
+import 'package:intl/date_symbol_data_local.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'package:geolocator/geolocator.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await initializeDateFormatting('ko_KR', null);
+  runApp(const UlsanCalendarApp());
+}
+
+class UlsanCalendarApp extends StatelessWidget {
+  const UlsanCalendarApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: '울산캘린더',
+      theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blue),
+      home: const MainPage(),
+      debugShowCheckedModeBanner: false,
+    );
+  }
+}
+
+// ----------------------------------------------------------------------------
+// 메인 페이지 (하단 네비게이션)
+// ----------------------------------------------------------------------------
+class MainPage extends StatefulWidget {
+  const MainPage({super.key});
+  @override
+  State<MainPage> createState() => _MainPageState();
+}
+
+class _MainPageState extends State<MainPage> {
+  int _selectedIndex = 0;
+  final List<Widget> _pages = [
+    const CalendarPage(),
+    const NewsPage(),
+    const BoardPage(),
+    const MapPage(),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: _pages[_selectedIndex],
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _selectedIndex,
+        onDestinationSelected: (i) => setState(() => _selectedIndex = i),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.calendar_month), label: '캘린더'),
+          NavigationDestination(icon: Icon(Icons.article), label: '뉴스'),
+          NavigationDestination(icon: Icon(Icons.forum), label: '자유게시판'),
+          NavigationDestination(icon: Icon(Icons.map), label: '지도'),
+        ],
+      ),
+    );
+  }
+}
+
+// ----------------------------------------------------------------------------
+// ① 캘린더 페이지
+// ----------------------------------------------------------------------------
+class CalendarPage extends StatefulWidget {
+  const CalendarPage({super.key});
+  @override
+  State<CalendarPage> createState() => _CalendarPageState();
+}
+
+class _CalendarPageState extends State<CalendarPage> {
+  DateTime _focusedDay = DateTime.now();
+  DateTime? _selectedDay;
+  Map<String, List<EventItem>> _events = {};
+  String _selectedCategory = '축제';
+  List<NewsItem> _newsList = [];
+  bool _loadingNews = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadEvents();
+    _fetchNewsForCategory(_selectedCategory);
+  }
+
+  Future<void> _loadEvents() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString('events');
+    if (saved != null) {
+      final Map<String, dynamic> map = json.decode(saved);
+      setState(() {
+        _events = map.map((key, value) {
+          final list = (value as List).map((e) => EventItem.fromJson(e)).toList();
+          return MapEntry(key, list);
+        });
+      });
+    }
+  }
+
+  Future<void> _saveEvents() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saveMap =
+    _events.map((key, value) => MapEntry(key, value.map((e) => e.toJson()).toList()));
+    prefs.setString('events', json.encode(saveMap));
+  }
+
+  List<EventItem> _getEventsForDay(DateTime day) {
+    final key = "${day.year}-${day.month}-${day.day}";
+    return _events[key] ?? [];
+  }
+
+  void _addEvent(DateTime date, EventItem event) {
+    final key = "${date.year}-${date.month}-${date.day}";
+    setState(() {
+      _events.putIfAbsent(key, () => []);
+      _events[key]!.add(event);
+    });
+    _saveEvents();
+  }
+
+  Future<void> _fetchNewsForCategory(String category) async {
+    setState(() => _loadingNews = true);
+    final query = (category == '축제')
+        ? '울산 축제 OR 울산 행사 OR 울산 페스티벌'
+        : (category == '공연,전시')
+        ? '울산 공연 OR 울산 전시 OR 울산 문화예술'
+        : '울산 스포츠 OR 울산 경기 OR 울산 체육대회';
+    final apiUrl =
+        'https://newsapi.org/v2/everything?q=$query&language=ko&sortBy=publishedAt&apiKey=YOUR_API_KEY_HERE';
+
+    final res = await http.get(Uri.parse(apiUrl));
+    if (res.statusCode == 200) {
+      final body = json.decode(res.body);
+      final List<dynamic> articles = body['articles'];
+      setState(() {
+        _newsList = articles.map((a) => NewsItem.fromJson(a, category)).toList();
+        _loadingNews = false;
+      });
+      _parseNewsToEvents(_newsList);
+    } else {
+      setState(() {
+        _newsList = [];
+        _loadingNews = false;
+      });
+    }
+  }
+
+  void _parseNewsToEvents(List<NewsItem> list) {
+    final regex = RegExp(r'(\d{1,2})월\s*(\d{1,2})일');
+    for (final item in list) {
+      final match = regex.firstMatch(item.title ?? '');
+      if (match != null) {
+        final month = int.tryParse(match.group(1)!);
+        final day = int.tryParse(match.group(2)!);
+        if (month != null && day != null) {
+          final date = DateTime(DateTime.now().year, month, day);
+          final event = EventItem(
+            title: item.titleShort(),
+            category: item.category,
+            url: item.url,
+          );
+          _addEvent(date, event);
+        }
+      }
+    }
+  }
+
+  void _onCategorySelected(String category) {
+    setState(() {
+      _selectedCategory = category;
+      _newsList = [];
+    });
+    _fetchNewsForCategory(category);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text("울산캘린더"),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            onPressed: () {
+              // 설정 기능 나중에 추가
+            },
+          )
+        ],
+      ),
+      body: Column(
+        children: [
+          TableCalendar<EventItem>(
+            locale: 'ko_KR',
+            firstDay: DateTime.utc(2020, 1, 1),
+            lastDay: DateTime.utc(2030, 12, 31),
+            focusedDay: _focusedDay,
+            selectedDayPredicate: (d) => isSameDay(_selectedDay, d),
+            onDaySelected: (selected, focused) {
+              setState(() {
+                _selectedDay = selected;
+                _focusedDay = focused;
+              });
+              showModalBottomSheet(
+                context: context,
+                builder: (_) => _eventList(selected),
+              );
+            },
+            eventLoader: _getEventsForDay,
+            calendarBuilders: CalendarBuilders<EventItem>(
+              markerBuilder: (context, date, events) {
+                if (events.isNotEmpty) {
+                  return Positioned(
+                    bottom: 1,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: events.map((e) {
+                        Color c;
+                        if (e.category == '축제') c = Colors.redAccent.shade200;
+                        else if (e.category == '공연,전시') c = Colors.greenAccent.shade200;
+                        else c = Colors.blueAccent.shade200;
+                        return Container(
+                          margin: const EdgeInsets.symmetric(horizontal: 1),
+                          width: 6,
+                          height: 6,
+                          decoration: BoxDecoration(color: c, shape: BoxShape.circle),
+                        );
+                      }).toList(),
+                    ),
+                  );
+                }
+                return const SizedBox();
+              },
+            ),
+            calendarStyle: const CalendarStyle(
+              todayDecoration: BoxDecoration(color: Colors.blue, shape: BoxShape.circle),
+              selectedDecoration: BoxDecoration(color: Colors.orange, shape: BoxShape.circle),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Row(
+              children: [
+                _buildCategoryButton("축제", Colors.redAccent.shade100),
+                _buildCategoryButton("공연,전시", Colors.greenAccent.shade100),
+                _buildCategoryButton("스포츠", Colors.blueAccent.shade100),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          Expanded(
+            child: _loadingNews
+                ? const Center(child: CircularProgressIndicator())
+                : _newsList.isEmpty
+                ? const Center(child: Text("카테고리를 선택하세요 🎈"))
+                : ListView.builder(
+              itemCount: _newsList.length,
+              itemBuilder: (context, i) {
+                final n = _newsList[i];
+                return ListTile(
+                  title: Text(n.title ?? ''),
+                  onTap: () async {
+                    final url = n.url;
+                    if (url != null && await canLaunch(url)) {
+                      await launch(url);
+                    }
+                  },
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCategoryButton(String label, Color color) {
+    final isSelected = _selectedCategory == label;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => _onCategorySelected(label),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          margin: const EdgeInsets.symmetric(horizontal: 4),
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            color: isSelected ? color : color.withOpacity(0.4),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+                color: isSelected ? Colors.black45 : Colors.transparent, width: 1),
+          ),
+          child: Center(
+            child: Text(label,
+                style:
+                const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _eventList(DateTime day) {
+    final events = _getEventsForDay(day);
+    return SizedBox(
+      height: 300,
+      child: Column(
+        children: [
+          ListTile(
+            title: Text("${day.month}월 ${day.day}일 일정 (${events.length}개)"),
+          ),
+          Expanded(
+            child: events.isEmpty
+                ? const Center(child: Text("등록된 일정이 없습니다."))
+                : ListView.builder(
+              itemCount: events.length,
+              itemBuilder: (context, i) {
+                final e = events[i];
+                return ListTile(
+                  leading: const Icon(Icons.event),
+                  title: Text(e.title),
+                  onTap: () async {
+                    if (e.url != null && await canLaunch(e.url!)) {
+                      await launch(e.url!);
+                    }
+                  },
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ----------------------------------------------------------------------------
+// ② 뉴스 페이지 (울산 전체 뉴스)
+// ----------------------------------------------------------------------------
+class NewsPage extends StatefulWidget {
+  const NewsPage({super.key});
+  @override
+  State<NewsPage> createState() => _NewsPageState();
+}
+
+class _NewsPageState extends State<NewsPage> {
+  List<NewsItem> articles = [];
+  bool loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchGeneralNews();
+  }
+
+  Future<void> _fetchGeneralNews() async {
+    const apiUrl =
+        'https://newsapi.org/v2/everything?q=울산&language=ko&sortBy=publishedAt&apiKey=YOUR_API_KEY_HERE';
+    final res = await http.get(Uri.parse(apiUrl));
+    if (res.statusCode == 200) {
+      final body = json.decode(res.body);
+      final List<dynamic> arr = body['articles'];
+      setState(() {
+        articles = arr.map((a) => NewsItem.fromJson(a, '일반')).toList();
+        loading = false;
+      });
+    } else {
+      setState(() => loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("📰 울산 뉴스")),
+      body: loading
+          ? const Center(child: CircularProgressIndicator())
+          : ListView.builder(
+        itemCount: articles.length,
+        itemBuilder: (context, i) {
+          final a = articles[i];
+          return ListTile(
+            title: Text(a.title ?? ''),
+            onTap: () async {
+              if (a.url != null && await canLaunch(a.url!)) {
+                await launch(a.url!);
+              }
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+// ----------------------------------------------------------------------------
+// ③ 자유게시판
+// ----------------------------------------------------------------------------
+class BoardPage extends StatefulWidget {
+  const BoardPage({super.key});
+  @override
+  State<BoardPage> createState() => _BoardPageState();
+}
+
+class _BoardPageState extends State<BoardPage> {
+  final controller = TextEditingController();
+  List<String> posts = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPosts();
+  }
+
+  Future<void> _loadPosts() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getStringList('posts') ?? [];
+    setState(() => posts = saved);
+  }
+
+  Future<void> _savePosts() async {
+    final prefs = await SharedPreferences.getInstance();
+    prefs.setStringList('posts', posts);
+  }
+
+  void _addPost() {
+    if (controller.text.trim().isEmpty) return;
+    setState(() {
+      posts.insert(0, controller.text.trim());
+    });
+    controller.clear();
+    _savePosts();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("💬 자유게시판")),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: controller,
+                    decoration: const InputDecoration(
+                        hintText: "글을 입력하세요", border: OutlineInputBorder()),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                ElevatedButton(onPressed: _addPost, child: const Text("등록")),
+              ],
+            ),
+          ),
+          Expanded(
+            child: ListView.builder(
+              itemCount: posts.length,
+              itemBuilder: (context, i) => Card(
+                margin: const EdgeInsets.all(6),
+                child: ListTile(title: Text(posts[i])),
+              ),
+            ),
+          )
+        ],
+      ),
+    );
+  }
+}
+
+// ----------------------------------------------------------------------------
+// ④ 지도 페이지
+// ----------------------------------------------------------------------------
+class MapPage extends StatefulWidget {
+  const MapPage({super.key});
+  @override
+  State<MapPage> createState() => _MapPageState();
+}
+
+class _MapPageState extends State<MapPage> {
+  GoogleMapController? mapController;
+  LatLng? currentPos;
+  final List<Marker> _markers = [
+    const Marker(
+      markerId: MarkerId('태화강'),
+      position: LatLng(35.5395, 129.3116),
+      infoWindow: InfoWindow(title: '태화강 국가정원'),
+    ),
+    const Marker(
+      markerId: MarkerId('고래문화마을'),
+      position: LatLng(35.498, 129.364),
+      infoWindow: InfoWindow(title: '장생포 고래문화마을'),
+    ),
+    const Marker(
+      markerId: MarkerId('간절곶'),
+      position: LatLng(35.3573, 129.3603),
+      infoWindow: InfoWindow(title: '간절곶 해맞이 명소'),
+    ),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _determinePosition();
+  }
+
+  Future<void> _determinePosition() async {
+    LocationPermission permission = await Geolocator.requestPermission();
+    Position pos = await Geolocator.getCurrentPosition();
+    setState(() {
+      currentPos = LatLng(pos.latitude, pos.longitude);
+      _markers.add(
+        Marker(
+          markerId: const MarkerId('현재위치'),
+          position: currentPos!,
+          icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed),
+          infoWindow: const InfoWindow(title: '내 위치'),
+        ),
+      );
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("🗺 지도")),
+      body: currentPos == null
+          ? const Center(child: CircularProgressIndicator())
+          : GoogleMap(
+        initialCameraPosition:
+        CameraPosition(target: currentPos!, zoom: 12),
+        markers: Set.from(_markers),
+        myLocationEnabled: true,
+        onMapCreated: (controller) => mapController = controller,
+      ),
+    );
+  }
+}
+
+// ----------------------------------------------------------------------------
+// 데이터 모델
+// ----------------------------------------------------------------------------
+class NewsItem {
+  final String? title;
+  final String? url;
+  final String category;
+
+  NewsItem({this.title, this.url, required this.category});
+
+  factory NewsItem.fromJson(Map<String, dynamic> json, String category) {
+    return NewsItem(
+      title: json['title'],
+      url: json['url'],
+      category: category,
+    );
+  }
+
+  String titleShort() {
+    if (title == null) return '';
+    if (title!.length > 20) return '${title!.substring(0, 20)}…';
+    return title!;
+  }
+}
+
+class EventItem {
+  final String title;
+  final String category;
+  final String? url;
+
+  EventItem({required this.title, required this.category, this.url});
+
+  Map<String, dynamic> toJson() {
+    return {'title': title, 'category': category, 'url': url};
+  }
+
+  factory EventItem.fromJson(Map<String, dynamic> json) {
+    return EventItem(
+      title: json['title'],
+      category: json['category'],
+      url: json['url'],
+    );
+  }
+}
